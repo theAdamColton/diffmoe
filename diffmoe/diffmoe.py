@@ -223,7 +223,7 @@ class DiffMoeMLP(nn.Module):
         if self.b1s is not None:
             y = einx.add("(k n) dd, n dd -> (k n) dd", y, self.b1s)
 
-        y = F.gelu(y, approximate="tanh")
+        y = self.activation_fn(y)
 
         y = einx.dot("(k n) dd, n d dd -> (k n) d", y, self.fc2s)
         if self.b2s is not None:
@@ -257,10 +257,14 @@ class DiffMoeMLP(nn.Module):
 
         # TODO this does not work well with torch.compile
         for i in range(self.num_experts):
+            # bs n -> bs
             expert_mask = keep_mask[:, i]
+            # bs d, bs -> m d
             x_selected = x[expert_mask]
 
+            # m d -> m n
             scores = self.forward_gate(x_selected)
+            # m n -> m
             scores = scores[:, i]
 
             # Forward this expert's mlp
@@ -286,6 +290,7 @@ class DiffMoeMLP(nn.Module):
             resids[expert_mask] += x_selected
 
         x = x + resids
+        x = x.reshape(og_shape)
         return x
 
     def forward(self, x, padding_mask=None):
