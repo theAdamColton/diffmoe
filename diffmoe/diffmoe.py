@@ -8,6 +8,10 @@ import torch.nn.functional as F
 from torch.nn import init
 
 
+def nearest_next_mult(val, mult=64):
+    return math.ceil(val / mult) * mult
+
+
 class EMAParameter(nn.Module):
     def __init__(self, size, beta=0.95):
         super().__init__()
@@ -300,7 +304,7 @@ class DiffMoeMLP(nn.Module):
         device, dtype = x.device, x.dtype
 
         x_flat = einx.rearrange("... d -> (...) d", x)
-        bs = x_flat.shape[0]
+        bs, d = x_flat.shape
 
         capacity_logits = self.capacity_predictor(x_flat.detach())
         capacity_thresholds = self.capacity_predictor_thresholds(capacity_logits)
@@ -318,7 +322,14 @@ class DiffMoeMLP(nn.Module):
             return x.reshape(og_shape)
 
         # Prepare padded tensors (experts x max_capacity)
-        max_capacity = bs  # Safe upper bound
+        tokens_per_expert = einx.sum("[bs] n", keep_mask)
+        max_capacity = tokens_per_expert.amax()
+        # Keep the compiler happy by padding each experts activated tokens to a max_capacity
+        mult = 64
+        if bs < mult:
+            mult = 16
+        max_capacity = nearest_next_mult(max_capacity, mult=mult)
+
         padded_indices = torch.full(
             (self.num_experts, max_capacity), -1, dtype=torch.long, device=device
         )
@@ -340,9 +351,8 @@ class DiffMoeMLP(nn.Module):
                 ]
 
         # Gather token values with padding protection
-        x_padded = torch.cat(
-            [x_flat, torch.zeros(1, x_flat.shape[-1], device=device, dtype=dtype)]
-        )
+        x_padding = torch.zeros(1, d, device=device, dtype=dtype)
+        x_padded = torch.cat([x_flat, x_padding])
         tokens = x_padded[padded_indices]  # [num_experts, max_capacity, d]
 
         # Process all experts in parallel
