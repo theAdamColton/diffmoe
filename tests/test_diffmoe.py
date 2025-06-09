@@ -36,8 +36,8 @@ class TestDiffMoe(unittest.TestCase):
         mlp = mlp.eval()
         with torch.no_grad():
             mlp.training_capacity = 1.0
-            y = mlp(x, padding_mask=padding_mask[:sequence_length])
-            y_padded = mlp(x_padded, padding_mask=padding_mask)
+            y, *_ = mlp(x, padding_mask=padding_mask[:sequence_length])
+            y_padded, *_ = mlp(x_padded, padding_mask=padding_mask)
 
         y_unpadded = y_padded[:sequence_length]
         self.assertTrue(torch.allclose(y, y_unpadded, rtol=0.01, atol=0.01))
@@ -69,6 +69,6 @@ class TestDiffMoe(unittest.TestCase):
 
         mlp = mlp.eval()
         with torch.no_grad():
-            y_eval = mlp(x)
+            y_eval, *_ = mlp(x)
 
         self.assertTrue(torch.allclose(y, y_eval, rtol=0.1, atol=0.05))

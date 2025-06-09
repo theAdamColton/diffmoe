@@ -156,6 +156,44 @@ class DiffMoeMLP(nn.Module):
 
         return loss
 
+    def run_mlp(
+        self, x: torch.Tensor, keep_indices: torch.Tensor, keep_scores: torch.Tensor
+    ):
+        """
+        x: bs d - Flattened tokens
+        keep_indices: k n - For each of the n experts, contains k indices indicating the
+         positions into [bs] of the activated tokens.
+        keep_scores: k n - A score for each of the kept tokens
+
+        Returns:
+            A tensor x: bs d
+            which is the original input x with the residual added in of the
+            tokens processed by experts
+        """
+        keep_indices = einx.rearrange("k n -> (k n)", keep_indices)
+
+        # [bs] d, (k n) -> (k n) d
+        y = torch.index_select(x, 0, keep_indices)
+
+        y = self.norm(y)
+
+        y = einx.dot("(k n) d, n dd d -> (k n) dd", y, self.fc1s)
+        if self.b1s is not None:
+            y = einx.add("(k n) dd, n dd -> (k n) dd", y, self.b1s)
+
+        y = self.activation_fn(y)
+
+        y = einx.dot("(k n) dd, n d dd -> (k n) d", y, self.fc2s)
+        if self.b2s is not None:
+            y = einx.add("(k n) d, n d -> (k n) d", y, self.b2s)
+
+        y = einx.multiply("(k n) d, k n -> (k n) d", y, keep_scores)
+        y = y.to(x.dtype)
+
+        x = torch.index_add(x, 0, keep_indices, y)
+
+        return x
+
     def forward_training(
         self,
         x: torch.Tensor,
@@ -187,201 +225,88 @@ class DiffMoeMLP(nn.Module):
         if padding_mask is not None:
             padding_mask = einx.rearrange("... -> (...)", padding_mask)
             assert bs == padding_mask.shape[0]
-            mask_value = -200
+            mask_value = -1e9
             scores = scores.masked_fill(padding_mask.unsqueeze(-1), mask_value)
 
         # k is the total number of MLP forward passes over all experts
         k = int(bs * self.training_capacity) // self.num_experts
 
-        sorted_expert_weights, sorted_expert_idx = scores.sort(0, descending=True)
-        kept_expert_weights, dropped_expert_weights = (
-            sorted_expert_weights[:k],
-            sorted_expert_weights[k:],
-        )
-        kept_expert_idx, dropped_expert_idx = (
-            sorted_expert_idx[:k],
-            sorted_expert_idx[k:],
-        )
+        # TODO replace with topk which is faster
+        sorted_expert_scores, sorted_expert_idx = scores.sort(0, descending=True)
+        keep_scores = sorted_expert_scores[:k]
+        keep_indices = sorted_expert_idx[:k]
 
         # Compute capacity predictor loss
+        # Construct keep_mask, which is (bs n), and contains 1.0
+        # where the ith token is activated by the jth expert, and 0.0 otherwise.
         keep_mask = torch.zeros(bs, self.num_experts, device=device, dtype=dtype)
-
         ones = torch.ones(k, self.num_experts, device=device, dtype=dtype)
         # for i in range (k)
         # for j in range (n)
         # keep_mask[kept_expert_idx[i,j], j] = ones[i,j]
-        keep_mask.scatter_(0, kept_expert_idx, ones)
+        keep_mask.scatter_(0, keep_indices, ones)
 
         capacity_predictor_loss = self.compute_capacity_predictor_loss(
             x, keep_mask, padding_mask
         )
 
-        kept_expert_idx = einx.rearrange("k n -> (k n)", kept_expert_idx)
-
-        # [b] d, (k n) -> (k n) d
-        y = torch.index_select(x, 0, kept_expert_idx)
-
-        y = self.norm(y)
-
-        y = einx.dot("(k n) d, n dd d -> (k n) dd", y, self.fc1s)
-        if self.b1s is not None:
-            y = einx.add("(k n) dd, n dd -> (k n) dd", y, self.b1s)
-
-        y = self.activation_fn(y)
-
-        y = einx.dot("(k n) dd, n d dd -> (k n) d", y, self.fc2s)
-        if self.b2s is not None:
-            y = einx.add("(k n) d, n d -> (k n) d", y, self.b2s)
-
-        y = einx.multiply("(k n) d, k n -> (k n) d", y, kept_expert_weights)
-        y = y.to(x.dtype)
-
-        x = torch.index_add(x, 0, kept_expert_idx, y)
+        x = self.run_mlp(x, keep_indices, keep_scores)
 
         x = x.reshape(og_shape)
 
         return (x, capacity_predictor_loss)
 
-    def forward_eval_old(
-        self, x: torch.Tensor, padding_mask: torch.Tensor | None = None
-    ):
-        og_shape = x.shape
-        device, dtype = x.device, x.dtype
-
-        x = einx.rearrange("... d -> (...) d", x)
-        bs = x.shape[0]
-
-        capacity_logits = self.capacity_predictor(x.detach())
-        capacity_thresholds = self.capacity_predictor_thresholds(capacity_logits)
-        # bs n
-        keep_mask = capacity_logits > capacity_thresholds
-
-        if padding_mask is not None:
-            keep_mask.masked_fill_(padding_mask.unsqueeze(-1), False)
-
-        resids = torch.zeros_like(x)
-
-        # TODO this does not work well with torch.compile
-        for i in range(self.num_experts):
-            # bs n -> bs
-            expert_mask = keep_mask[:, i]
-            # bs d, bs -> m d
-            x_selected = x[expert_mask]
-
-            # m d -> m n
-            scores = self.forward_gate(x_selected)
-            # m n -> m
-            scores = scores[:, i]
-
-            # Forward this expert's mlp
-            x_selected = self.norm(x_selected)
-            fc1 = self.fc1s[i]
-            x_selected = einx.dot("m d, dd d -> m dd", x_selected, fc1)
-
-            if self.b1s is not None:
-                b1 = self.b1s[i]
-                x_selected = einx.add("m dd, dd", x_selected, b1)
-
-            x_selected = self.activation_fn(x_selected)
-
-            fc2 = self.fc2s[i]
-            x_selected = einx.dot("m dd, d dd -> m d", x_selected, fc2)
-
-            if self.b2s is not None:
-                b2 = self.b2s[i]
-                x_selected = einx.add("m d, d", x_selected, b2)
-
-            x_selected = einx.multiply("m d, m", x_selected, scores)
-
-            resids[expert_mask] += x_selected
-
-        x = x + resids
-        x = x.reshape(og_shape)
-        return x
-
     def forward_eval(self, x: torch.Tensor, padding_mask: torch.Tensor | None = None):
         og_shape = x.shape
         device, dtype = x.device, x.dtype
 
-        x_flat = einx.rearrange("... d -> (...) d", x)
-        bs, d = x_flat.shape
+        x = einx.rearrange("... d -> (...) d", x)
+        bs, d = x.shape
 
-        capacity_logits = self.capacity_predictor(x_flat.detach())
-        capacity_thresholds = self.capacity_predictor_thresholds(capacity_logits)
-        keep_mask = capacity_logits > capacity_thresholds
+        capacity_logits = self.capacity_predictor(x.detach())
 
         if padding_mask is not None:
             padding_mask_flat = einx.rearrange("... -> (...)", padding_mask)
-            keep_mask = keep_mask & (~padding_mask_flat).unsqueeze(-1)
+            mask_value = -1e9
+            capacity_logits.masked_fill_(padding_mask_flat.unsqueeze(-1), mask_value)
 
-        # Precompute gate scores for all tokens
-        gate_scores = self.forward_gate(x_flat)
+        capacity_thresholds = self.capacity_predictor_thresholds(capacity_logits)
+        keep_mask = capacity_logits > capacity_thresholds
 
         # If no tokens are activated, return early
         if not keep_mask.any():
+            print("Warning! DiffMoeMLP has no selected tokens during eval!")
             return x.reshape(og_shape)
 
         # Prepare padded tensors (experts x max_capacity)
         tokens_per_expert = einx.sum("[bs] n", keep_mask)
         max_capacity = tokens_per_expert.amax()
-        # Keep the compiler happy by padding each experts activated tokens to a max_capacity
+        # Keep the compiler happy by padding to a max_capacity
         mult = 64
         if bs < mult:
             mult = 16
         max_capacity = nearest_next_mult(max_capacity, mult=mult)
+        if max_capacity > bs:
+            max_capacity = bs
+            if max_capacity % mult != 0:
+                print("Warning! unable to dynamically pad")
 
-        padded_indices = torch.full(
-            (self.num_experts, max_capacity), -1, dtype=torch.long, device=device
-        )
-        padded_scores = torch.zeros(
-            (self.num_experts, max_capacity), dtype=gate_scores.dtype, device=device
-        )
+        # Prepare keep indices
+        keep_indices = capacity_logits.topk(max_capacity, dim=0, sorted=False).indices
+        # bs d -> bs n
+        gate_scores = self.forward_gate(x)
+        # Mask using the gate scores - tokens with a 0.0 gate score
+        # do not contribute
+        gate_scores = einx.multiply("bs n, bs n", gate_scores, keep_mask)
+        # for i in range(bs)
+        # for j in range(n)
+        # keep_scores[i,j] = gate_scores[keep_idx[i,j],j]
+        keep_scores = gate_scores.gather(0, keep_indices)
 
-        # Gather indices and scores for each expert
-        for expert_idx in range(self.num_experts):
-            expert_mask = keep_mask[:, expert_idx]
-            indices = torch.where(expert_mask)[0]
-            num_activated = len(indices)
+        x = self.run_mlp(x, keep_indices, keep_scores)
 
-            if num_activated > 0:
-                # Pad indices and scores to max_capacity
-                padded_indices[expert_idx, :num_activated] = indices
-                padded_scores[expert_idx, :num_activated] = gate_scores[
-                    indices, expert_idx
-                ]
-
-        # Gather token values with padding protection
-        x_padding = torch.zeros(1, d, device=device, dtype=dtype)
-        x_padded = torch.cat([x_flat, x_padding])
-        tokens = x_padded[padded_indices]  # [num_experts, max_capacity, d]
-
-        # Process all experts in parallel
-        tokens = self.norm(tokens)
-        tokens = einx.dot("n m d, n dd d -> n m dd", tokens, self.fc1s)
-
-        if self.b1s is not None:
-            tokens = einx.add("n m dd, n dd -> n m dd", tokens, self.b1s)
-
-        tokens = self.activation_fn(tokens)
-        tokens = einx.dot("n m dd, n d dd -> n m d", tokens, self.fc2s)
-
-        if self.b2s is not None:
-            tokens = einx.add("n m d, n d -> n m d", tokens, self.b2s)
-
-        # Apply expert-specific weights
-        tokens = tokens * padded_scores.unsqueeze(-1)
-
-        # Scatter results back to original positions
-        flat_output = einx.rearrange("n m d -> (n m) d", tokens)
-        flat_indices = einx.rearrange("n m -> (n m)", padded_indices)
-        valid_mask = flat_indices != -1
-
-        if valid_mask.any():
-            resids = torch.zeros_like(x_flat)
-            resids.index_add_(0, flat_indices[valid_mask], flat_output[valid_mask])
-            x_flat = x_flat + resids
-
-        return x_flat.reshape(og_shape)
+        x = x.reshape(og_shape)
+        return (x,)
 
     def forward(self, x, padding_mask=None):
         if self.training:
