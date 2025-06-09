@@ -2,6 +2,8 @@ import copy
 from datetime import datetime
 import uuid
 from pathlib import Path
+import json
+import random
 
 import torch
 import einx
@@ -10,12 +12,17 @@ from torch.nn import init
 import torch.nn.functional as F
 import jsonargparse
 from dataclasses import dataclass, field
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 @dataclass
 class AttentionConfig:
     head_dim: int = 64
-    num_heads: int = 4
+    num_heads: int = 1
 
 
 class Attention(nn.Module):
@@ -46,8 +53,7 @@ class Attention(nn.Module):
 
 @dataclass
 class VanillaDiTBlockConfig:
-    hidden_size: int = 256
-    cond_size: int = 256
+    hidden_size: int = 64
 
     attention_config: AttentionConfig = field(default_factory=lambda: AttentionConfig())
 
@@ -69,23 +75,26 @@ class VanillaDiTBlock(nn.Module):
         )
 
     def forward(self, x, cond):
-        x = x + self.attn(self.norm1(x, cond))
+        # Add timestep conditioning to all tokens
+        x = einx.add("b s d, b d -> b s d", x, cond)
+        x = x + self.attn(self.norm1(x))
         x = x + self.mlp(self.norm2(x))
         return x
 
 
 @dataclass
 class DiTConfig:
-    image_channels: int = 3
-    image_height: int = 64
-    image_width: int = 64
+    image_channels: int = 1  # Changed to 1 for MNIST
+    image_height: int = 28  # Changed to 28 for MNIST
+    image_width: int = 28  # Changed to 28 for MNIST
 
     num_timesteps: int = 1000
     num_cond_embeddings: int = 10
+    cond_length: int = 15
 
     patch_size: int = 4
 
-    num_blocks: int = 8
+    num_blocks: int = 4
     block_config: VanillaDiTBlockConfig = field(
         default_factory=lambda: VanillaDiTBlockConfig()
     )
@@ -104,7 +113,9 @@ class DiT(nn.Module):
         self.proj_in = nn.Linear(self.input_size, self.hidden_size)
 
         self.cond_embedding = nn.Parameter(
-            torch.empty(config.num_cond_embeddings, self.hidden_size)
+            torch.empty(
+                config.num_cond_embeddings, config.cond_length, self.hidden_size
+            )
         )
         init.trunc_normal_(self.cond_embedding, std=0.02)
 
@@ -159,11 +170,9 @@ class DiT(nn.Module):
         x = einx.add("... s d, s d", x, pos_emb)
 
         c = self.cond_embedding[c]
-        c = einx.add("... s d, s d -> ... s d", c, self.cond_pos_embedding)
-
         t = self.timestep_embedding[t]
 
-        cond_length = c.shape[1]
+        b, cond_length, d = c.shape
         x = torch.cat((c, x), 1)
 
         for block in self.blocks:
@@ -178,12 +187,147 @@ class DiT(nn.Module):
         return x
 
 
-def get_viz_output_path():
-    folder_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    folder_str += str(uuid.uuid4())
-    viz_output_path = Path(".") / "viz-outputs" / folder_str
-    viz_output_path.mkdir(parents=True)
+def get_output_path():
+    folder_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    folder_str += "_" + str(uuid.uuid4())[:8]
+    viz_output_path = Path(".") / "outputs" / folder_str
+    viz_output_path.mkdir(parents=True, exist_ok=True)
     return viz_output_path
+
+
+def set_seed(seed):
+    """Set seed for reproducibility"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def load_mnist_data(batch_size):
+    """Load MNIST dataset"""
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,)),  # Normalize to [-1, 1]
+        ]
+    )
+
+    train_dataset = datasets.MNIST(
+        root="./data", train=True, download=True, transform=transform
+    )
+    val_dataset = datasets.MNIST(
+        root="./data", train=False, download=True, transform=transform
+    )
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=2
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False, num_workers=2
+    )
+
+    return train_loader, val_loader
+
+
+def generate_samples(
+    dit, scheduler, device, autocast_dtype, seed=42, num_inference_steps=20
+):
+    """Generate samples for all digits 0-9"""
+    set_seed(seed)
+
+    # Generate one sample for each digit
+    cond = torch.arange(10, device=device)
+
+    b = cond.shape[0]
+    noise = torch.randn(
+        b,
+        dit.config.image_channels,
+        dit.config.image_height,
+        dit.config.image_width,
+        device=device,
+        dtype=autocast_dtype,
+    )
+
+    inference_scheduler = copy.deepcopy(scheduler)
+    inference_scheduler.set_timesteps(num_inference_steps)
+
+    for timestep in inference_scheduler.timesteps:
+        timestep = timestep.item()
+        timestep_tensor = torch.full((b,), timestep, device=device)
+        with torch.inference_mode():
+            with torch.autocast(device, autocast_dtype):
+                noise_pred = dit(noise, cond, timestep_tensor)
+
+        noise = inference_scheduler.step(
+            noise_pred.float(), timestep, noise.float()
+        ).prev_sample.to(autocast_dtype)
+
+    return noise
+
+
+def save_image_grid(images, save_path, epoch):
+    """Save a 2x5 grid of generated images"""
+    fig, axes = plt.subplots(2, 5, figsize=(10, 4))
+    for i, ax in enumerate(axes.flat):
+        img = images[i].cpu().numpy().squeeze()
+        img = (img + 1) / 2  # Denormalize from [-1, 1] to [0, 1]
+        ax.imshow(img, cmap="gray")
+        ax.set_title(f"Digit {i}")
+        ax.axis("off")
+
+    plt.tight_layout()
+    plt.savefig(
+        save_path / f"generated_epoch_{epoch:03d}.png", dpi=150, bbox_inches="tight"
+    )
+    plt.close()
+
+
+def log_to_jsonl(log_file, **kwargs):
+    """Log metrics to JSONL file"""
+    with open(log_file, "a") as f:
+        json.dump(kwargs, f)
+        f.write("\n")
+
+
+def compute_validation_loss(dit, val_loader, scheduler, device, autocast_dtype):
+    """Compute validation loss"""
+    dit.eval()
+    total_loss = 0.0
+    num_batches = 0
+
+    with torch.no_grad():
+        for batch_idx, (images, labels) in enumerate(val_loader):
+            if batch_idx >= 10:  # Only use first 10 batches for speed
+                break
+
+            images = images.to(device, dtype=autocast_dtype)
+            labels = labels.to(device)
+
+            # Sample random timesteps
+            timesteps = torch.randint(
+                0,
+                scheduler.config.num_train_timesteps,
+                (images.shape[0],),
+                device=device,
+            )
+
+            # Add noise
+            noise = torch.randn_like(images)
+            noisy_images = scheduler.add_noise(images, noise, timesteps)
+
+            # Predict noise
+            with torch.autocast(device, autocast_dtype):
+                noise_pred = dit(noisy_images, labels, timesteps)
+
+            # Compute loss
+            loss = F.mse_loss(noise_pred, noise)
+            total_loss += loss.item()
+            num_batches += 1
+
+    dit.train()
+    return total_loss / num_batches if num_batches > 0 else 0.0
 
 
 def main(
@@ -192,15 +336,24 @@ def main(
     should_compile: bool = False,
     dit_config: DiTConfig = DiTConfig(),
     validate_every_num_steps: int = 100,
-    num_epochs: int = 10,
+    num_epochs: int = 100,
     batch_size: int = 256,
+    seed: int = 42,
+    lr: float = 5e-4,
 ):
-    save_path = get_viz_output_path()
+    set_seed(seed)
+    save_path = get_output_path()
+    log_file = save_path / "training_log.jsonl"
+
+    print(f"Saving outputs to: {save_path}")
+
+    # Load data
+    train_loader, val_loader = load_mnist_data(batch_size)
 
     dit = DiT(dit_config).to(device)
 
     scaler = torch.GradScaler(device)
-    optim = torch.optim.AdamW(dit.parameters(), lr=5e-4, betas=(0.9, 0.95))
+    optim = torch.optim.AdamW(dit.parameters(), lr=lr, betas=(0.9, 0.95))
 
     if should_compile:
         dit = torch.compile(dit)
@@ -213,34 +366,112 @@ def main(
         num_train_timesteps=num_denoising_timesteps,
         rescale_betas_zero_snr=True,
         prediction_type="epsilon",
+        beta_schedule="linear",
     )
 
-    def generate(cond):
-        b, *_ = cond.shape
-        noise = torch.randn(
-            b,
-            dit_config.image_channels,
-            dit_config.image_height,
-            dit_config.image_width,
-            device=device,
-            dtype=autocast_dtype,
+    global_step = 0
+
+    for epoch in range(num_epochs):
+        dit.train()
+        epoch_loss = 0.0
+        num_batches = 0
+
+        for batch_idx, (images, labels) in enumerate(train_loader):
+            images = images.to(device, dtype=autocast_dtype)
+            labels = labels.to(device)
+
+            # Sample random timesteps
+            timesteps = torch.randint(
+                0,
+                scheduler.config.num_train_timesteps,
+                (images.shape[0],),
+                device=device,
+            )
+
+            # Add noise
+            noise = torch.randn_like(images)
+            noisy_images = scheduler.add_noise(images, noise, timesteps)
+
+            # Forward pass
+            optim.zero_grad()
+            with torch.autocast(device, autocast_dtype):
+                noise_pred = dit(noisy_images, labels, timesteps)
+                loss = F.mse_loss(noise_pred, noise)
+
+            # Backward pass
+            scaler.scale(loss).backward()
+            scaler.step(optim)
+            scaler.update()
+
+            epoch_loss += loss.item()
+            num_batches += 1
+            global_step += 1
+
+            # Log training step
+            log_to_jsonl(
+                log_file,
+                global_step=global_step,
+                epoch=epoch,
+                training_loss=loss.item(),
+            )
+
+            # Validation
+            if global_step % validate_every_num_steps == 0:
+                val_loss = compute_validation_loss(
+                    dit, val_loader, scheduler, device, autocast_dtype
+                )
+                log_to_jsonl(
+                    log_file,
+                    global_step=global_step,
+                    epoch=epoch,
+                    validation_loss=val_loss,
+                )
+                print(f"Step {global_step}, Epoch {epoch}, Val Loss: {val_loss:.4f}")
+
+        avg_epoch_loss = epoch_loss / num_batches
+
+        # Compute validation loss at end of epoch
+        val_loss = compute_validation_loss(
+            dit, val_loader, scheduler, device, autocast_dtype
+        )
+        log_to_jsonl(
+            log_file,
+            global_step=global_step,
+            epoch=epoch,
+            epoch_training_loss=avg_epoch_loss,
+            validation_loss=val_loss,
         )
 
-        inference_scheduler = copy.deepcopy(scheduler)
-        inference_scheduler.set_timesteps(num_denoising_timesteps)
+        print(
+            f"Epoch {epoch}, Train Loss: {avg_epoch_loss:.4f}, Val Loss: {val_loss:.4f}"
+        )
 
-        for timestep in inference_scheduler.timesteps:
-            timestep = timestep.item()
-            timestep_tensor = torch.full((b,), timestep, device=device)
-            with torch.inference_mode():
-                with torch.autocast(device, autocast_dtype):
-                    noise_pred = dit(noise, cond, timestep_tensor)
+        # Generate samples every 10 epochs
+        if epoch % 10 == 0:
+            print(f"Generating samples at epoch {epoch}...")
+            generated_images = generate_samples(
+                dit, scheduler, device, autocast_dtype, seed=seed + epoch
+            )
+            save_image_grid(generated_images, save_path, epoch)
 
-            noise = inference_scheduler.step(
-                noise_pred.float(), timestep, noise.float()
-            ).prev_sample.to(autocast_dtype)
+    # Generate final samples
+    print("Generating final samples...")
+    generated_images = generate_samples(
+        dit, scheduler, device, autocast_dtype, seed=seed
+    )
+    save_image_grid(generated_images, save_path, num_epochs)
 
-        return noise
+    # Save model
+    torch.save(
+        {
+            "model_state_dict": dit.state_dict(),
+            "config": dit_config,
+            "epoch": num_epochs,
+        },
+        save_path / "final_model.pt",
+    )
+
+    print(f"Training complete. Outputs saved to: {save_path}")
 
 
 if __name__ == "__main__":

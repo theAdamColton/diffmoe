@@ -14,6 +14,8 @@ examples = [
     "datasets>=3.6.0",
     "diffusers>=0.33.1",
     "jsonargparse>=4.40.0",
+    "matplotlib>=3.10.3",
+    "torchvision>=0.22.1",
 ]
 
 [dependency-groups]
