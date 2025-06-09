@@ -181,10 +181,10 @@ class DiffMoeMLP(nn.Module):
         scores = self.forward_gate(x)
 
         if padding_mask is not None:
-            padding_mask = einx.rearrange("... -> (...) one", padding_mask, one=1)
+            padding_mask = einx.rearrange("... -> (...)", padding_mask)
             assert bs == padding_mask.shape[0]
             mask_value = -200
-            scores = scores.masked_fill(padding_mask, mask_value)
+            scores = scores.masked_fill(padding_mask.unsqueeze(-1), mask_value)
 
         # k is the total number of MLP forward passes over all experts
         k = int(bs * self.training_capacity) // self.num_experts
@@ -238,7 +238,9 @@ class DiffMoeMLP(nn.Module):
 
         return (x, capacity_predictor_loss)
 
-    def forward_eval(self, x: torch.Tensor, padding_mask: torch.Tensor | None = None):
+    def forward_eval_old(
+        self, x: torch.Tensor, padding_mask: torch.Tensor | None = None
+    ):
         og_shape = x.shape
         device, dtype = x.device, x.dtype
 
@@ -292,6 +294,84 @@ class DiffMoeMLP(nn.Module):
         x = x + resids
         x = x.reshape(og_shape)
         return x
+
+    def forward_eval(self, x: torch.Tensor, padding_mask: torch.Tensor | None = None):
+        og_shape = x.shape
+        device, dtype = x.device, x.dtype
+
+        x_flat = einx.rearrange("... d -> (...) d", x)
+        bs = x_flat.shape[0]
+
+        capacity_logits = self.capacity_predictor(x_flat.detach())
+        capacity_thresholds = self.capacity_predictor_thresholds(capacity_logits)
+        keep_mask = capacity_logits > capacity_thresholds
+
+        if padding_mask is not None:
+            padding_mask_flat = einx.rearrange("... -> (...)", padding_mask)
+            keep_mask = keep_mask & (~padding_mask_flat).unsqueeze(-1)
+
+        # Precompute gate scores for all tokens
+        gate_scores = self.forward_gate(x_flat)
+
+        # If no tokens are activated, return early
+        if not keep_mask.any():
+            return x.reshape(og_shape)
+
+        # Prepare padded tensors (experts x max_capacity)
+        max_capacity = bs  # Safe upper bound
+        padded_indices = torch.full(
+            (self.num_experts, max_capacity), -1, dtype=torch.long, device=device
+        )
+        padded_scores = torch.zeros(
+            (self.num_experts, max_capacity), dtype=gate_scores.dtype, device=device
+        )
+
+        # Gather indices and scores for each expert
+        for expert_idx in range(self.num_experts):
+            expert_mask = keep_mask[:, expert_idx]
+            indices = torch.where(expert_mask)[0]
+            num_activated = len(indices)
+
+            if num_activated > 0:
+                # Pad indices and scores to max_capacity
+                padded_indices[expert_idx, :num_activated] = indices
+                padded_scores[expert_idx, :num_activated] = gate_scores[
+                    indices, expert_idx
+                ]
+
+        # Gather token values with padding protection
+        x_padded = torch.cat(
+            [x_flat, torch.zeros(1, x_flat.shape[-1], device=device, dtype=dtype)]
+        )
+        tokens = x_padded[padded_indices]  # [num_experts, max_capacity, d]
+
+        # Process all experts in parallel
+        tokens = self.norm(tokens)
+        tokens = einx.dot("n m d, n dd d -> n m dd", tokens, self.fc1s)
+
+        if self.b1s is not None:
+            tokens = einx.add("n m dd, n dd -> n m dd", tokens, self.b1s)
+
+        tokens = self.activation_fn(tokens)
+        tokens = einx.dot("n m dd, n d dd -> n m d", tokens, self.fc2s)
+
+        if self.b2s is not None:
+            tokens = einx.add("n m d, n d -> n m d", tokens, self.b2s)
+
+        # Apply expert-specific weights
+        tokens = tokens * padded_scores.unsqueeze(-1)
+
+        # Scatter results back to original positions
+        flat_output = einx.rearrange("n m d -> (n m) d", tokens)
+        flat_indices = einx.rearrange("n m -> (n m)", padded_indices)
+        valid_mask = flat_indices != -1
+
+        if valid_mask.any():
+            resids = torch.zeros_like(x_flat)
+            resids.index_add_(0, flat_indices[valid_mask], flat_output[valid_mask])
+            x_flat = x_flat + resids
+
+        return x_flat.reshape(og_shape)
 
     def forward(self, x, padding_mask=None):
         if self.training:
