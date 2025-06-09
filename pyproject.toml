@@ -1,0 +1,15 @@
+[project]
+name = "diffmoe"
+version = "0.1.0"
+description = "Mixture of Experts MLP for Vision Transformers"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "einx>=0.3.0",
+    "torch>=2.7.1",
+]
+
+[dependency-groups]
+dev = [
+    "bpython>=0.25",
+]
