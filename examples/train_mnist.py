@@ -116,7 +116,7 @@ class DiTConfig:
 
     patch_size: int = 4
 
-    num_blocks: int = 8
+    num_blocks: int = 4
 
     use_diff_moe: bool = False
     vanilla_block: VanillaDiTBlockConfig = field(
@@ -203,6 +203,8 @@ class DiT(nn.Module):
 
         c = self.cond_embedding[c]
         t = self.timestep_embedding[t]
+
+        c = einx.add("b s d, b d", c, t)
 
         b, cond_length, d = c.shape
         x = torch.cat((c, x), 1)
