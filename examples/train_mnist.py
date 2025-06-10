@@ -316,7 +316,7 @@ def save_image_grid(images, save_path, epoch):
     """Save a 2x5 grid of generated images"""
     fig, axes = plt.subplots(2, 5, figsize=(10, 4))
     for i, ax in enumerate(axes.flat):
-        img = images[i].cpu().float().numpy().squeeze()
+        img = images[i].cpu().float().clip(-1, 1).numpy().squeeze()
         img = (img + 1) / 2  # Denormalize from [-1, 1] to [0, 1]
         ax.imshow(img, cmap="gray")
         ax.set_title(f"Digit {i}")
@@ -331,6 +331,9 @@ def save_image_grid(images, save_path, epoch):
 
 def log_to_jsonl(log_file, **kwargs):
     """Log metrics to JSONL file"""
+    kwargs = {
+        k: v.item() if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()
+    }
     with open(log_file, "a") as f:
         json.dump(kwargs, f)
         f.write("\n")
@@ -449,7 +452,7 @@ def main(
             scaler.step(optim)
             scaler.update()
 
-            epoch_loss += loss.item()
+            epoch_loss += diffusion_loss.item()
             num_batches += 1
             global_step += 1
 
@@ -458,9 +461,9 @@ def main(
                 log_file,
                 global_step=global_step,
                 epoch=epoch,
-                training_loss=loss.item(),
-                training_capacity_loss=capacity_loss.item(),
-                training_diffusion_loss=diffusion_loss.item(),
+                training_loss=loss,
+                training_capacity_loss=capacity_loss,
+                training_diffusion_loss=diffusion_loss,
             )
 
             # Validation
@@ -497,9 +500,11 @@ def main(
         # Generate samples every 10 epochs
         if epoch % 10 == 0:
             print(f"Generating samples at epoch {epoch}...")
+            dit = dit.eval()
             generated_images = generate_samples(
                 dit, scheduler, device, autocast_dtype, seed=seed + epoch
             )
+            dit = dit.train()
             save_image_grid(generated_images, save_path, epoch)
 
     # Generate final samples
