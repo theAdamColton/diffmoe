@@ -145,7 +145,9 @@ class DiffMoeMLP(nn.Module):
 
         # Find the thresholds such that there are k logits > thresholds
         # bs n -> n
-        thresholds = torch.quantile(logits.detach().float(), 1 - k / bs, dim=0)
+        logits = logits.detach().float()
+        thresholds = logits.sort(0).values[-k, :]
+        # thresholds = torch.quantile(logits, 1 - k / bs, dim=0)
 
         if dist.is_initialized():
             dist.all_reduce(thresholds, op=dist.ReduceOp.SUM)

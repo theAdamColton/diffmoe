@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import jsonargparse
 from dataclasses import dataclass, field
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+from transformers.optimization import get_cosine_schedule_with_warmup
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
@@ -83,7 +84,7 @@ class VanillaDiTBlock(nn.Module):
 @dataclass
 class DiffMoeDiTBlockConfig:
     hidden_size: int = 128
-    num_experts: int = 8
+    num_experts: int = 16
 
     attention: AttentionConfig = field(default_factory=lambda: AttentionConfig())
 
@@ -257,10 +258,10 @@ def load_mnist_data(batch_size):
     )
 
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=2
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=4
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False, num_workers=2
+        val_dataset, batch_size=batch_size, shuffle=False, num_workers=4
     )
 
     return train_loader, val_loader
@@ -381,9 +382,9 @@ def main(
     dit_config: DiTConfig = DiTConfig(),
     validate_every_num_steps: int = 100,
     num_epochs: int = 100,
-    batch_size: int = 256,
-    seed: int = 42,
+    batch_size: int = 1024,
     lr: float = 5e-4,
+    ema_beta: float = 0.998,
 ):
     save_path = get_output_path()
     log_file = save_path / "training_log.jsonl"
@@ -394,12 +395,22 @@ def main(
     train_loader, val_loader = load_mnist_data(batch_size)
 
     dit = DiT(dit_config).to(device)
+    ema_dit = DiT(dit_config).to(device)
+    ema_dit.load_state_dict(dit.state_dict())
+    ema_dit.requires_grad_(False)
 
     scaler = torch.GradScaler(device)
     optim = torch.optim.AdamW(dit.parameters(), lr=lr, betas=(0.9, 0.95))
+    num_train_steps = len(train_loader) * num_epochs
+    lr_scheduler = get_cosine_schedule_with_warmup(
+        optim,
+        num_warmup_steps=int(num_train_steps * 0.1),
+        num_training_steps=int(num_train_steps * 1.25),
+    )
 
     if should_compile:
         dit = torch.compile(dit)
+        ema_dit = torch.compile(ema_dit)
 
     nparameters = sum(p.numel() for p in dit.parameters() if p.requires_grad)
     print("NUM PARAMETERS", nparameters)
@@ -446,6 +457,12 @@ def main(
             scaler.scale(loss).backward()
             scaler.step(optim)
             scaler.update()
+            lr_scheduler.step()
+
+            for p_dst, p_src in zip(ema_dit.parameters(), dit.parameters()):
+                if not p_dst.is_floating_point():
+                    continue
+                p_dst.lerp_(p_src, 1 - ema_beta)
 
             epoch_loss += diffusion_loss.item()
             num_batches += 1
@@ -459,6 +476,7 @@ def main(
                 training_loss=loss,
                 training_capacity_loss=capacity_loss,
                 training_diffusion_loss=diffusion_loss,
+                training_lr=lr_scheduler.get_last_lr()[-1],
             )
 
             # Validation
@@ -495,18 +513,15 @@ def main(
         # Generate samples every 10 epochs
         if epoch % 10 == 0:
             print(f"Generating samples at epoch {epoch}...")
-            dit = dit.eval()
+            ema_dit = ema_dit.eval()
             generated_images = generate_samples(
-                dit, scheduler, device, autocast_dtype, seed=seed + epoch
+                ema_dit, scheduler, device, autocast_dtype
             )
-            dit = dit.train()
             save_image_grid(generated_images, save_path, epoch)
 
     # Generate final samples
     print("Generating final samples...")
-    generated_images = generate_samples(
-        dit, scheduler, device, autocast_dtype, seed=seed
-    )
+    generated_images = generate_samples(dit, scheduler, device, autocast_dtype)
     save_image_grid(generated_images, save_path, num_epochs)
 
     # Save model

@@ -16,6 +16,7 @@ examples = [
     "jsonargparse>=4.40.0",
     "matplotlib>=3.10.3",
     "torchvision>=0.22.1",
+    "transformers>=4.52.4",
 ]
 
 [dependency-groups]
