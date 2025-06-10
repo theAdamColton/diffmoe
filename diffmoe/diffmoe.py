@@ -8,14 +8,10 @@ import torch.nn.functional as F
 from torch.nn import init
 
 
-def nearest_next_mult(val, mult=64):
-    return math.ceil(val / mult) * mult
-
-
 class EMAParameter(nn.Module):
     def __init__(self, size, beta=0.95):
         super().__init__()
-        self.parameter = nn.Parameter(torch.empty(size), requires_grad=False)
+        self.parameter = nn.Parameter(torch.zeros(size), requires_grad=False)
         self.is_initted = nn.Parameter(
             torch.zeros(1, dtype=torch.bool), requires_grad=False
         )
@@ -265,7 +261,6 @@ class DiffMoeMLP(nn.Module):
         dynamic_padding_mult: int = 64,
     ):
         og_shape = x.shape
-        device, dtype = x.device, x.dtype
 
         x = einx.rearrange("... d -> (...) d", x)
         bs, d = x.shape
@@ -290,13 +285,12 @@ class DiffMoeMLP(nn.Module):
         tokens_per_expert = einx.sum("[bs] n", keep_mask)
         max_capacity = tokens_per_expert.amax()
         # Keep the compiler happy by padding to a max_capacity
-        mult = dynamic_padding_mult
-        if bs < mult:
-            mult = 16
-        max_capacity = nearest_next_mult(max_capacity, mult=mult)
+        max_capacity = (
+            math.ceil(max_capacity / dynamic_padding_mult) * dynamic_padding_mult
+        )
         if max_capacity > bs:
             max_capacity = bs
-            if max_capacity % mult != 0:
+            if max_capacity % dynamic_padding_mult != 0:
                 print("Warning! unable to dynamically pad")
 
         # Prepare keep indices
