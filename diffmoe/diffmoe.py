@@ -258,7 +258,12 @@ class DiffMoeMLP(nn.Module):
 
         return (x, capacity_predictor_loss)
 
-    def forward_eval(self, x: torch.Tensor, padding_mask: torch.Tensor | None = None):
+    def forward_eval(
+        self,
+        x: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+        dynamic_padding_mult: int = 64,
+    ):
         og_shape = x.shape
         device, dtype = x.device, x.dtype
 
@@ -284,7 +289,7 @@ class DiffMoeMLP(nn.Module):
         tokens_per_expert = einx.sum("[bs] n", keep_mask)
         max_capacity = tokens_per_expert.amax()
         # Keep the compiler happy by padding to a max_capacity
-        mult = 64
+        mult = dynamic_padding_mult
         if bs < mult:
             mult = 16
         max_capacity = nearest_next_mult(max_capacity, mult=mult)
@@ -310,8 +315,12 @@ class DiffMoeMLP(nn.Module):
         x = x.reshape(og_shape)
         return (x,)
 
-    def forward(self, x, padding_mask=None):
+    def forward(self, x, padding_mask=None, dynamic_padding_mult=64):
         if self.training:
             return self.forward_training(x=x, padding_mask=padding_mask)
         else:
-            return self.forward_eval(x=x, padding_mask=padding_mask)
+            return self.forward_eval(
+                x=x,
+                padding_mask=padding_mask,
+                dynamic_padding_mult=dynamic_padding_mult,
+            )
