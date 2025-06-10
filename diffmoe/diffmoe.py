@@ -145,7 +145,7 @@ class DiffMoeMLP(nn.Module):
 
         # Find the thresholds such that there are k logits > thresholds
         # bs n -> n
-        thresholds = torch.quantile(logits.detach(), 1 - k / bs, dim=0)
+        thresholds = torch.quantile(logits.detach().float(), 1 - k / bs, dim=0)
 
         if dist.is_initialized():
             dist.all_reduce(thresholds, op=dist.ReduceOp.SUM)
@@ -276,7 +276,7 @@ class DiffMoeMLP(nn.Module):
         # If no tokens are activated, return early
         if not keep_mask.any():
             print("Warning! DiffMoeMLP has no selected tokens during eval!")
-            return x.reshape(og_shape)
+            return (x.reshape(og_shape),)
 
         # Prepare padded tensors (experts x max_capacity)
         tokens_per_expert = einx.sum("[bs] n", keep_mask)

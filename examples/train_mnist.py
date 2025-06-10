@@ -18,15 +18,17 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import numpy as np
 
+from diffmoe.diffmoe import DiffMoeMLP
+
 
 @dataclass
 class AttentionConfig:
     head_dim: int = 64
-    num_heads: int = 1
+    num_heads: int = 2
 
 
 class Attention(nn.Module):
-    def __init__(self, config: AttentionConfig):
+    def __init__(self, config: AttentionConfig = AttentionConfig()):
         super().__init__()
         self.config = config
 
@@ -53,18 +55,18 @@ class Attention(nn.Module):
 
 @dataclass
 class VanillaDiTBlockConfig:
-    hidden_size: int = 64
+    hidden_size: int = 128
 
-    attention_config: AttentionConfig = field(default_factory=lambda: AttentionConfig())
+    attention: AttentionConfig = field(default_factory=lambda: AttentionConfig())
 
 
 class VanillaDiTBlock(nn.Module):
-    def __init__(self, config: VanillaDiTBlockConfig):
+    def __init__(self, config: VanillaDiTBlockConfig = VanillaDiTBlockConfig()):
         super().__init__()
         self.config = config
 
         self.norm1 = nn.LayerNorm(config.hidden_size)
-        self.attn = Attention(config.attention_config)
+        self.attn = Attention(config.attention)
 
         self.norm2 = nn.LayerNorm(config.hidden_size)
 
@@ -74,19 +76,41 @@ class VanillaDiTBlock(nn.Module):
             nn.Linear(config.hidden_size * 4, config.hidden_size),
         )
 
-    def forward(self, x, cond):
-        # Add timestep conditioning to all tokens
-        x = einx.add("b s d, b d -> b s d", x, cond)
+    def forward(self, x):
         x = x + self.attn(self.norm1(x))
         x = x + self.mlp(self.norm2(x))
         return x
 
 
 @dataclass
+class DiffMoeDiTBlockConfig:
+    hidden_size: int = 128
+    num_experts: int = 8
+
+    attention: AttentionConfig = field(default_factory=lambda: AttentionConfig())
+
+
+class DiffMoeDiTBlock(nn.Module):
+    def __init__(self, config: DiffMoeDiTBlockConfig = DiffMoeDiTBlockConfig()):
+        super().__init__()
+        self.config = config
+        self.norm1 = nn.LayerNorm(config.hidden_size)
+        self.attn = Attention(config.attention)
+        self.mlp = DiffMoeMLP(
+            embed_dim=config.hidden_size, num_experts=config.num_experts
+        )
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x, *mlp_results = self.mlp(x)
+        return x, *mlp_results
+
+
+@dataclass
 class DiTConfig:
-    image_channels: int = 1  # Changed to 1 for MNIST
-    image_height: int = 28  # Changed to 28 for MNIST
-    image_width: int = 28  # Changed to 28 for MNIST
+    image_channels: int = 1
+    image_height: int = 28
+    image_width: int = 28
 
     num_timesteps: int = 1000
     num_cond_embeddings: int = 10
@@ -94,9 +118,14 @@ class DiTConfig:
 
     patch_size: int = 4
 
-    num_blocks: int = 4
-    block_config: VanillaDiTBlockConfig = field(
+    num_blocks: int = 8
+
+    use_diff_moe: bool = False
+    vanilla_block: VanillaDiTBlockConfig = field(
         default_factory=lambda: VanillaDiTBlockConfig()
+    )
+    diffmoe_block: DiffMoeDiTBlockConfig = field(
+        default_factory=lambda: DiffMoeDiTBlockConfig()
     )
 
 
@@ -106,7 +135,7 @@ class DiT(nn.Module):
 
         self.config = config
 
-        self.hidden_size = config.block_config.hidden_size
+        self.hidden_size = config.vanilla_block.hidden_size
 
         self.input_size = config.image_channels * config.patch_size**2
 
@@ -133,9 +162,14 @@ class DiT(nn.Module):
         )
         init.trunc_normal_(self.width_position_embed, std=0.02)
 
-        self.blocks = nn.ModuleList(
-            VanillaDiTBlock(config.block_config) for _ in range(config.num_blocks)
-        )
+        if config.use_diff_moe:
+            self.blocks = nn.ModuleList(
+                DiffMoeDiTBlock(config.diffmoe_block) for _ in range(config.num_blocks)
+            )
+        else:
+            self.blocks = nn.ModuleList(
+                VanillaDiTBlock(config.vanilla_block) for _ in range(config.num_blocks)
+            )
 
         self.norm_out = nn.LayerNorm(self.hidden_size)
         self.proj_out = nn.Linear(self.hidden_size, self.input_size)
@@ -175,8 +209,19 @@ class DiT(nn.Module):
         b, cond_length, d = c.shape
         x = torch.cat((c, x), 1)
 
+        all_capacity_losses = 0
         for block in self.blocks:
-            x = block(x, t)
+            block_result = block(x)
+
+            if config.use_diff_moe:
+                x, *mlp_results = block_result
+                if self.training:
+                    capacity_loss, *_ = mlp_results
+                    all_capacity_losses = all_capacity_losses + capacity_loss
+            else:
+                x = block_result
+
+        all_capacity_losses = all_capacity_losses / config.num_blocks
 
         c, x = x[:, :cond_length, :], x[:, cond_length:, :]
 
@@ -184,7 +229,7 @@ class DiT(nn.Module):
         x = self.proj_out(x)
         x = self.unpatchify(x)
 
-        return x
+        return x, all_capacity_losses
 
 
 def get_output_path():
@@ -258,7 +303,7 @@ def generate_samples(
         timestep_tensor = torch.full((b,), timestep, device=device)
         with torch.inference_mode():
             with torch.autocast(device, autocast_dtype):
-                noise_pred = dit(noise, cond, timestep_tensor)
+                noise_pred, *_ = dit(noise, cond, timestep_tensor)
 
         noise = inference_scheduler.step(
             noise_pred.float(), timestep, noise.float()
@@ -271,7 +316,7 @@ def save_image_grid(images, save_path, epoch):
     """Save a 2x5 grid of generated images"""
     fig, axes = plt.subplots(2, 5, figsize=(10, 4))
     for i, ax in enumerate(axes.flat):
-        img = images[i].cpu().numpy().squeeze()
+        img = images[i].cpu().float().numpy().squeeze()
         img = (img + 1) / 2  # Denormalize from [-1, 1] to [0, 1]
         ax.imshow(img, cmap="gray")
         ax.set_title(f"Digit {i}")
@@ -319,7 +364,7 @@ def compute_validation_loss(dit, val_loader, scheduler, device, autocast_dtype):
 
             # Predict noise
             with torch.autocast(device, autocast_dtype):
-                noise_pred = dit(noisy_images, labels, timesteps)
+                noise_pred, *_ = dit(noisy_images, labels, timesteps)
 
             # Compute loss
             loss = F.mse_loss(noise_pred, noise)
@@ -395,8 +440,9 @@ def main(
             # Forward pass
             optim.zero_grad()
             with torch.autocast(device, autocast_dtype):
-                noise_pred = dit(noisy_images, labels, timesteps)
-                loss = F.mse_loss(noise_pred, noise)
+                noise_pred, capacity_loss, *_ = dit(noisy_images, labels, timesteps)
+                diffusion_loss = F.mse_loss(noise_pred, noise)
+                loss = diffusion_loss + capacity_loss
 
             # Backward pass
             scaler.scale(loss).backward()
@@ -413,6 +459,8 @@ def main(
                 global_step=global_step,
                 epoch=epoch,
                 training_loss=loss.item(),
+                training_capacity_loss=capacity_loss.item(),
+                training_diffusion_loss=diffusion_loss.item(),
             )
 
             # Validation
