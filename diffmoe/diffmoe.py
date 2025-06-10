@@ -145,7 +145,7 @@ class DiffMoeMLP(nn.Module):
 
         # Find the thresholds such that there are k logits > thresholds
         # bs n -> n
-        logits = logits.detach().float()
+        logits = logits.detach()
         thresholds = logits.sort(0).values[-k, :]
         # thresholds = torch.quantile(logits, 1 - k / bs, dim=0)
 
@@ -270,6 +270,7 @@ class DiffMoeMLP(nn.Module):
         x = einx.rearrange("... d -> (...) d", x)
         bs, d = x.shape
 
+        # bs d -> bs n
         capacity_logits = self.capacity_predictor(x.detach())
 
         if padding_mask is not None:
@@ -299,12 +300,14 @@ class DiffMoeMLP(nn.Module):
                 print("Warning! unable to dynamically pad")
 
         # Prepare keep indices
+        # bs n -> k n
         keep_indices = capacity_logits.topk(max_capacity, dim=0, sorted=False).indices
         # bs d -> bs n
         gate_scores = self.forward_gate(x)
         # Mask using the gate scores - tokens with a 0.0 gate score
         # do not contribute
         gate_scores = einx.multiply("bs n, bs n", gate_scores, keep_mask)
+        # bs n, k n -> k n
         # for i in range(bs)
         # for j in range(n)
         # keep_scores[i,j] = gate_scores[keep_idx[i,j],j]
