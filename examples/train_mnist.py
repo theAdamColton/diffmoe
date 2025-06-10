@@ -3,7 +3,6 @@ from datetime import datetime
 import uuid
 from pathlib import Path
 import json
-import random
 
 import torch
 import einx
@@ -16,7 +15,6 @@ from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
-import numpy as np
 
 from diffmoe.diffmoe import DiffMoeMLP
 
@@ -240,16 +238,6 @@ def get_output_path():
     return viz_output_path
 
 
-def set_seed(seed):
-    """Set seed for reproducibility"""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
 def load_mnist_data(batch_size):
     """Load MNIST dataset"""
     transform = transforms.Compose(
@@ -277,13 +265,18 @@ def load_mnist_data(batch_size):
 
 
 def generate_samples(
-    dit, scheduler, device, autocast_dtype, seed=42, num_inference_steps=20
+    dit,
+    scheduler: DDIMScheduler,
+    device,
+    autocast_dtype,
+    seed=42,
+    num_inference_steps=20,
 ):
     """Generate samples for all digits 0-9"""
-    set_seed(seed)
-
     # Generate one sample for each digit
     cond = torch.arange(10, device=device)
+
+    rng = torch.Generator(device).manual_seed(seed)
 
     b = cond.shape[0]
     noise = torch.randn(
@@ -293,6 +286,7 @@ def generate_samples(
         dit.config.image_width,
         device=device,
         dtype=autocast_dtype,
+        generator=rng,
     )
 
     inference_scheduler = copy.deepcopy(scheduler)
@@ -306,7 +300,7 @@ def generate_samples(
                 noise_pred, *_ = dit(noise, cond, timestep_tensor)
 
         noise = inference_scheduler.step(
-            noise_pred.float(), timestep, noise.float()
+            noise_pred.float(), timestep, noise.float(), generator=rng
         ).prev_sample.to(autocast_dtype)
 
     return noise
@@ -389,7 +383,6 @@ def main(
     seed: int = 42,
     lr: float = 5e-4,
 ):
-    set_seed(seed)
     save_path = get_output_path()
     log_file = save_path / "training_log.jsonl"
 
