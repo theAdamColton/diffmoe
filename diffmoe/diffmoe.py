@@ -50,6 +50,7 @@ class DiffMoeMLP(nn.Module):
         training_capacity: float = 1.0,
         norm_module: nn.Module | None = None,
         activation_fn: nn.Module | None = None,
+        threshold_ema_beta: float = 0.95,
     ):
         super().__init__()
 
@@ -65,7 +66,9 @@ class DiffMoeMLP(nn.Module):
             nn.GELU(approximate="tanh"),
             nn.Linear(embed_dim, num_experts),
         )
-        self.capacity_predictor_thresholds = EMAParameter(num_experts)
+        self.capacity_predictor_thresholds = EMAParameter(
+            num_experts, beta=threshold_ema_beta
+        )
 
         self.fc1s = nn.Parameter(
             torch.empty(
