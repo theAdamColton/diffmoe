@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from diffmoe.diffmoe import DiffMoeMLP
+from diffmoe.diffmoe import DiffMoeMLP, masked_mean
 
 
 class TestDiffMoe(unittest.TestCase):
@@ -72,3 +72,10 @@ class TestDiffMoe(unittest.TestCase):
             y_eval, *_ = mlp(x)
 
         self.assertTrue(torch.allclose(y, y_eval, rtol=0.1, atol=0.05))
+
+    def test_masked_mean(self):
+        x = torch.randn(1024, 64) * 5
+        m = torch.randn(1024) > 0.5
+        mean = x[m].mean()
+        mean_hat = masked_mean(x, m)
+        self.assertAlmostEqual(mean.item(), mean_hat.item())

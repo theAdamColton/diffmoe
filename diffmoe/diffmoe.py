@@ -8,6 +8,19 @@ import torch.nn.functional as F
 from torch.nn import init
 
 
+def masked_mean(x, mask):
+    """
+    x: n d
+    mask: n
+
+    equivalent to x[mask].mean()
+    """
+    x = x.mean(-1)
+    x = x * mask
+    x = x.sum() / mask.sum().clip(1)
+    return x
+
+
 class EMAParameter(nn.Module):
     def __init__(self, size, beta=0.95):
         super().__init__()
@@ -141,7 +154,7 @@ class DiffMoeMLP(nn.Module):
 
         loss = F.binary_cross_entropy_with_logits(logits, labels, reduction="none")
         if padding_mask is not None:
-            loss = loss[~padding_mask].mean()
+            loss = masked_mean(loss, ~padding_mask)
         else:
             loss = loss.mean()
 
@@ -240,7 +253,7 @@ class DiffMoeMLP(nn.Module):
         if padding_mask is not None:
             padding_mask = einx.rearrange("... -> (...)", padding_mask)
             assert bs == padding_mask.shape[0]
-            mask_value = -1e9
+            mask_value = 0
             scores = scores.masked_fill(padding_mask.unsqueeze(-1), mask_value)
 
         # k is the total number of MLP forward passes over all experts
@@ -296,7 +309,7 @@ class DiffMoeMLP(nn.Module):
         # bs n
         # contains True where the ith token
         # is activated by the jth expert.
-        activation_mask = capacity_scores > capacity_thresholds
+        activation_mask = capacity_scores >= capacity_thresholds
 
         # If no tokens are activated, return early
         if not activation_mask.any():
