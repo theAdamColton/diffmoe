@@ -6,6 +6,16 @@ from diffmoe.diffmoe import DiffMoeMLP, masked_mean
 
 
 class TestDiffMoe(unittest.TestCase):
+    def test_fullgraph(self):
+        # Padding shouldnt effect outputs whatsoever
+        embed_dim = 8
+        sequence_length = 32
+        dtype = torch.float32
+        mlp = DiffMoeMLP(embed_dim=embed_dim).to(dtype)
+        mlp = torch.compile(mlp, fullgraph=True)
+        x = torch.randn(sequence_length, embed_dim, dtype=dtype)
+        outputs = mlp(x)
+
     def test_padding(self):
         # Padding shouldnt effect outputs whatsoever
         embed_dim = 8

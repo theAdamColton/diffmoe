@@ -29,16 +29,16 @@ class EMAParameter(nn.Module):
             torch.zeros(1, dtype=torch.bool), requires_grad=False
         )
         self.beta = beta
+        self.size = size
 
     def forward(self, x):
         training = self.training
-        needs_init = self.is_initted == 0
 
-        if training and needs_init:
-            self.parameter.copy_(x.to(self.parameter.dtype))
-            self.is_initted.fill_(1)
+        # Copies x into self.parameter when not is_initted
+        self.parameter += x * ~self.is_initted
+        self.is_initted.fill_(1)
 
-        elif training:
+        if training:
             p = self.parameter.float()
             x = x.float()
             # Lerp in float32
@@ -305,7 +305,7 @@ class DiffMoeMLP(nn.Module):
             mask_value = -1e9
             capacity_scores.masked_fill_(padding_mask_flat.unsqueeze(-1), mask_value)
 
-        capacity_thresholds = self.capacity_predictor_thresholds(capacity_scores)
+        capacity_thresholds = self.capacity_predictor_thresholds.parameter
         # bs n
         # contains True where the ith token
         # is activated by the jth expert.
