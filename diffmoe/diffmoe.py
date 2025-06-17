@@ -130,6 +130,12 @@ class DiffMoeMLP(nn.Module):
         labels: torch.Tensor,
         padding_mask: torch.Tensor | None = None,
     ):
+        """
+        x: bs d - Flattened normalized tokens
+        labels: bs n - Contains one or zero, one if the token was activated
+         by an expert and zero otherwise
+        padding_mask: bs - Optional mask
+        """
         bs, _ = x.shape
         logits = self.capacity_predictor(x.detach())
 
@@ -142,11 +148,14 @@ class DiffMoeMLP(nn.Module):
         # k is the total number of MLP forward passes over all experts
         k = int(bs * self.training_capacity) // self.num_experts
 
-        # Find the thresholds such that there are k logits > thresholds
-        # bs n -> n
         logits = logits.detach()
+        # Track thresholds in [0,1] space by applying a sigmoid activation,
+        # following: https://github.com/KwaiVGI/DiffMoE/blob/ad39aca9aa07b7dafca146bafd79abe803f2e247/models/models_DiffMoE.py#L60
+        logits = F.sigmoid(logits)
+
+        # Find the thresholds such that there are k logits >= thresholds
+        # bs n -> n
         thresholds = logits.sort(0).values[-k, :]
-        # thresholds = torch.quantile(logits, 1 - k / bs, dim=0)
 
         if dist.is_initialized():
             dist.all_reduce(thresholds, op=dist.ReduceOp.SUM)
@@ -158,10 +167,15 @@ class DiffMoeMLP(nn.Module):
         return loss
 
     def run_mlp(
-        self, x: torch.Tensor, keep_indices: torch.Tensor, keep_scores: torch.Tensor
+        self,
+        x: torch.Tensor,
+        norm_x: torch.Tensor,
+        keep_indices: torch.Tensor,
+        keep_scores: torch.Tensor,
     ):
         """
         x: bs d - Flattened tokens
+        norm_x: bs d - Flattened normalized tokens
         keep_indices: k n - For each of the n experts, contains k indices indicating the
          positions into [bs] of the activated tokens.
         keep_scores: k n - A score for each of the kept tokens
@@ -174,9 +188,7 @@ class DiffMoeMLP(nn.Module):
         keep_indices = einx.rearrange("k n -> (k n)", keep_indices)
 
         # [bs] d, (k n) -> (k n) d
-        y = torch.index_select(x, 0, keep_indices)
-
-        y = self.norm(y)
+        y = torch.index_select(norm_x, 0, keep_indices)
 
         y = einx.dot("(k n) d, n dd d -> (k n) dd", y, self.fc1s)
         if self.b1s is not None:
@@ -221,7 +233,9 @@ class DiffMoeMLP(nn.Module):
         x = einx.rearrange("... d -> (...) d", x)
         bs = x.shape[0]
 
-        scores = self.forward_gate(x)
+        norm_x = self.norm(x)
+
+        scores = self.forward_gate(norm_x)
 
         if padding_mask is not None:
             padding_mask = einx.rearrange("... -> (...)", padding_mask)
@@ -232,7 +246,6 @@ class DiffMoeMLP(nn.Module):
         # k is the total number of MLP forward passes over all experts
         k = int(bs * self.training_capacity) // self.num_experts
 
-        # TODO replace with topk which is faster
         sorted_expert_scores, sorted_expert_idx = scores.sort(0, descending=True)
         keep_scores = sorted_expert_scores[:k]
         keep_indices = sorted_expert_idx[:k]
@@ -248,10 +261,10 @@ class DiffMoeMLP(nn.Module):
         keep_mask.scatter_(0, keep_indices, ones)
 
         capacity_predictor_loss = self.compute_capacity_predictor_loss(
-            x, keep_mask, padding_mask
+            norm_x, keep_mask, padding_mask
         )
 
-        x = self.run_mlp(x, keep_indices, keep_scores)
+        x = self.run_mlp(x, norm_x, keep_indices, keep_scores)
 
         x = x.reshape(og_shape)
 
@@ -268,24 +281,30 @@ class DiffMoeMLP(nn.Module):
         x = einx.rearrange("... d -> (...) d", x)
         bs, d = x.shape
 
+        norm_x = self.norm(x)
+
         # bs d -> bs n
-        capacity_logits = self.capacity_predictor(x.detach())
+        capacity_scores = self.capacity_predictor(norm_x.detach())
+        capacity_scores = F.sigmoid(capacity_scores)
 
         if padding_mask is not None:
             padding_mask_flat = einx.rearrange("... -> (...)", padding_mask)
             mask_value = -1e9
-            capacity_logits.masked_fill_(padding_mask_flat.unsqueeze(-1), mask_value)
+            capacity_scores.masked_fill_(padding_mask_flat.unsqueeze(-1), mask_value)
 
-        capacity_thresholds = self.capacity_predictor_thresholds(capacity_logits)
-        keep_mask = capacity_logits > capacity_thresholds
+        capacity_thresholds = self.capacity_predictor_thresholds(capacity_scores)
+        # bs n
+        # contains True where the ith token
+        # is activated by the jth expert.
+        activation_mask = capacity_scores > capacity_thresholds
 
         # If no tokens are activated, return early
-        if not keep_mask.any():
-            print("Warning! DiffMoeMLP has no selected tokens during eval!")
+        if not activation_mask.any():
+            print("Warning! DiffMoeMLP has no activated tokens during eval!")
             return (x.reshape(og_shape),)
 
         # Prepare padded tensors (experts x max_capacity)
-        tokens_per_expert = einx.sum("[bs] n", keep_mask)
+        tokens_per_expert = einx.sum("[bs] n", activation_mask)
         max_capacity = tokens_per_expert.amax()
         # Keep the compiler happy by padding to a max_capacity
         max_capacity = (
@@ -298,19 +317,21 @@ class DiffMoeMLP(nn.Module):
 
         # Prepare keep indices
         # bs n -> k n
-        keep_indices = capacity_logits.topk(max_capacity, dim=0, sorted=False).indices
+        keep_indices = capacity_scores.topk(max_capacity, dim=0, sorted=False).indices
+
+        # Collect activated gated scores
         # bs d -> bs n
-        gate_scores = self.forward_gate(x)
-        # Mask using the gate scores - tokens with a 0.0 gate score
+        gate_scores = self.forward_gate(norm_x)
+        # Mask using the activation mask - tokens with a 0.0 gate score
         # do not contribute
-        gate_scores = einx.multiply("bs n, bs n", gate_scores, keep_mask)
+        gate_scores = einx.multiply("bs n, bs n", gate_scores, activation_mask)
         # bs n, k n -> k n
         # for i in range(bs)
         # for j in range(n)
         # keep_scores[i,j] = gate_scores[keep_idx[i,j],j]
         keep_scores = gate_scores.gather(0, keep_indices)
 
-        x = self.run_mlp(x, keep_indices, keep_scores)
+        x = self.run_mlp(x, norm_x, keep_indices, keep_scores)
 
         x = x.reshape(og_shape)
         return (x,)
